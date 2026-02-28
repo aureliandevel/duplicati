@@ -4,7 +4,7 @@ permissions:
   issues: none
   pull-requests: none
 
-on: [pull_request, workflow_dispatch]
+on: [workflow_dispatch]
 
 jobs:
   build_packages:
