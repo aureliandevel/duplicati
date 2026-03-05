@@ -135,6 +135,10 @@ namespace Duplicati.Library.Main.Operation.Restore
             /// </summary>
             private readonly Dictionary<long, long> m_volumecount = new();
             /// <summary>
+            /// Snapshot of the initial block-reference count per volume, used for drain-progress logging.
+            /// </summary>
+            private readonly Dictionary<long, long> m_volumecount_initial = new();
+            /// <summary>
             /// The options for the restore.
             /// </summary>
             private readonly Options m_options;
@@ -211,6 +215,16 @@ namespace Duplicati.Library.Main.Operation.Restore
                     sd.m_volumecount[volume_id] = vc ? v + 1 : 1;
                 }
 
+                foreach (var kvp in sd.m_volumecount)
+                    sd.m_volumecount_initial[kvp.Key] = kvp.Value;
+
+                Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeBlockCount",
+                    "Volume tracking initialized: {0} volumes, {1} total block-references. Top 10 by block count: {2}",
+                    sd.m_volumecount.Count,
+                    sd.m_volumecount.Values.Sum(),
+                    string.Join(", ", sd.m_volumecount.OrderByDescending(x => x.Value).Take(10).Select(x => $"{x.Key}:{x.Value}"))
+                );
+
                 return sd;
             }
 
@@ -226,6 +240,9 @@ namespace Duplicati.Library.Main.Operation.Restore
                 long error_block_id = -1;
                 long error_volume_id = -1;
                 var emit_evict = false;
+                long vol_count_after = 0;
+                long vol_initial = 0;
+                bool vol_milestone = false;
 
                 Logging.Log.WriteExplicitMessage(LOGTAG, "CheckCounts", "Trying to acquire m_blockcount_lock for block {0}", blockRequest.BlockID);
                 lock (m_blockcount_lock)
@@ -253,9 +270,16 @@ namespace Duplicati.Library.Main.Operation.Restore
                     if (vol_count > 0)
                     {
                         m_volumecount[blockRequest.VolumeID] = vol_count;
+                        if (m_volumecount_initial.TryGetValue(blockRequest.VolumeID, out var vi) && vi > 0)
+                        {
+                            vol_initial = vi;
+                            vol_count_after = vol_count;
+                            vol_milestone = (vol_count * 10 / vi) != ((vol_count + 1) * 10 / vi);
+                        }
                     }
                     else if (vol_count == 0)
                     {
+                        m_volumecount_initial.TryGetValue(blockRequest.VolumeID, out vol_initial);
                         m_volumecount.Remove(blockRequest.VolumeID);
                         blockRequest.RequestType = BlockRequestType.CacheEvict;
                         emit_evict = true;
@@ -268,9 +292,19 @@ namespace Duplicati.Library.Main.Operation.Restore
                 }
                 Logging.Log.WriteExplicitMessage(LOGTAG, "CheckCounts", "Released m_blockcount_lock for block {0}", blockRequest.BlockID);
 
+                if (vol_milestone)
+                    Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeBlockCount",
+                        "Volume {0}: {1}/{2} block-references remaining ({3}%)",
+                        blockRequest.VolumeID, vol_count_after, vol_initial, vol_count_after * 100 / vol_initial);
+
                 // Notify the `VolumeManager` that it should evict the volume.
                 if (emit_evict)
+                {
+                    Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeBlockCount",
+                        "Volume {0} fully consumed ({1} block-references). {2} volumes still tracked.",
+                        blockRequest.VolumeID, vol_initial, m_volumecount.Count);
                     await m_volume_request.WriteAsync(blockRequest).ConfigureAwait(false);
+                }
 
                 if (error_block_id != -1)
                 {

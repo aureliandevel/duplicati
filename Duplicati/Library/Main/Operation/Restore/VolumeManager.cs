@@ -135,6 +135,7 @@ namespace Duplicati.Library.Main.Operation.Restore
                     long disk_pressure_redownloads = 0;
                     long total_volumes_accessed = 0;
                     bool cache_exhausted_warned = false;
+                    long peak_cache_count = 0;
 
                     Stopwatch? sw_cache_set = options.InternalProfiling ? new() : null;
                     Stopwatch? sw_cache_evict = options.InternalProfiling ? new() : null;
@@ -156,6 +157,9 @@ namespace Duplicati.Library.Main.Operation.Restore
                             cache_last_touched.Remove(volume_id);
                         }
                         sw_cache_evict?.Stop();
+                        Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeCache",
+                            "VolumeManager evicted volume {0}: cache now {1} volumes ({2} bytes).",
+                            volume_id, cache.Count, cache_size);
                     }
 
                     void evict_lru()
@@ -280,6 +284,13 @@ namespace Duplicati.Library.Main.Operation.Restore
                                             cache_size += volume.Size;
                                         }
                                         cache_last_touched.Add(volume_id);
+                                        if (cache.Count > peak_cache_count)
+                                        {
+                                            peak_cache_count = cache.Count;
+                                            Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeCache",
+                                                "VolumeManager cache new peak: {0} volumes ({1} bytes).",
+                                                cache.Count, cache_size);
+                                        }
                                         sw_cache_set?.Stop();
                                         sw_wakeup?.Start();
                                         foreach (var request in in_flight_downloads[volume_id])
