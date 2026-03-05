@@ -2003,8 +2003,69 @@ namespace Duplicati.Library.Main.Database
             await m_dbLock.WaitAsync(token).ConfigureAwait(false);
             try
             {
-                // Order by length descending, so that larger files are restored first.
+                // Three-phase restore ordering to minimise volume cache thrashing:
+                //
+                //   Phase 1 (VolumeCount > 1): large files whose blocks span multiple volumes.
+                //     Ordered largest-first, then grouped by dominant volume (PrimaryVolID) so
+                //     that modified files sharing an "old" volume are adjacent and that volume
+                //     can be evicted as soon as the last of those files finishes.
+                //
+                //   Phase 2 (VolumeCount = 1): small files whose blocks fit in a single volume.
+                //     Grouped by the volume containing the most files (densest first) so that
+                //     each volume can be evicted the moment its last file is restored.
+                //     *** Extension point: replace the Phase 2 ORDER BY lines for a different
+                //         small-file strategy (e.g. graph-based clustering). ***
+                //
+                //   Phase 3 (VolumeCount IS NULL): zero-block entries — empty files, then
+                //     symlinks last so their targets are on disk before the link is created.
+                //
+                // Both data blocks (BlocksetID) and metadata blocks (MetadataID) are counted
+                // in every CTE so that files whose metadata lands in a different volume are
+                // correctly phased and grouped.
+                //
+                // The four ordering columns (VolumeCount, FileCountInVolume, PrimaryVolID,
+                // RestorePhase) are used only in ORDER BY via CTE names and are NOT added to
+                // the SELECT list. The positional reader (positions 0-5) is unchanged.
+                var str_symlinkblocksetid = Library.Utility.Utility.FormatInvariantValue(SYMLINK_BLOCKSET_ID);
                 await using var cmd = m_connection.CreateCommand($@"
+                    WITH ""FileVolumeCount"" AS (
+                        SELECT
+                            ""TF"".""ID"" AS ""FileID"",
+                            COUNT(DISTINCT ""B"".""VolumeID"") AS ""VolumeCount""
+                        FROM ""{m_tempfiletable}"" ""TF""
+                        JOIN ""BlocksetEntry"" ""BSE"" ON ""BSE"".""BlocksetID"" IN (""TF"".""BlocksetID"", ""TF"".""MetadataID"")
+                        JOIN ""Block"" ""B""           ON ""BSE"".""BlockID"" = ""B"".""ID""
+                        GROUP BY ""TF"".""ID""
+                    ),
+                    ""VolumeDensity"" AS (
+                        SELECT
+                            ""B"".""VolumeID"",
+                            COUNT(DISTINCT ""TF"".""ID"") AS ""FileCountInVolume""
+                        FROM ""{m_tempfiletable}"" ""TF""
+                        JOIN ""BlocksetEntry"" ""BSE"" ON ""BSE"".""BlocksetID"" IN (""TF"".""BlocksetID"", ""TF"".""MetadataID"")
+                        JOIN ""Block"" ""B""           ON ""BSE"".""BlockID"" = ""B"".""ID""
+                        GROUP BY ""B"".""VolumeID""
+                    ),
+                    ""FilePrimaryVolume"" AS (
+                        SELECT
+                            ""TF"".""ID""        AS ""FileID"",
+                            ""B"".""VolumeID""   AS ""PrimaryVolID"",
+                            SUM(""B"".""Size"")  AS ""DataInVol""
+                        FROM ""{m_tempfiletable}"" ""TF""
+                        JOIN ""BlocksetEntry"" ""BSE"" ON ""BSE"".""BlocksetID"" IN (""TF"".""BlocksetID"", ""TF"".""MetadataID"")
+                        JOIN ""Block"" ""B""           ON ""BSE"".""BlockID"" = ""B"".""ID""
+                        GROUP BY ""TF"".""ID"", ""B"".""VolumeID""
+                    ),
+                    ""FileBestVolume"" AS (
+                        SELECT ""FileID"", MIN(""PrimaryVolID"") AS ""PrimaryVolID""
+                        FROM ""FilePrimaryVolume"" ""FPV1""
+                        WHERE ""DataInVol"" = (
+                            SELECT MAX(""DataInVol"")
+                            FROM ""FilePrimaryVolume"" ""FPV2""
+                            WHERE ""FPV2"".""FileID"" = ""FPV1"".""FileID""
+                        )
+                        GROUP BY ""FileID""
+                    )
                     SELECT
                         ""F"".""ID"",
                         ""F"".""Path"",
@@ -2013,10 +2074,23 @@ namespace Duplicati.Library.Main.Database
                         IFNULL(""B"".""Length"", 0) AS ""Length"",
                         ""F"".""BlocksetID""
                     FROM ""{m_tempfiletable}"" ""F""
-                    LEFT JOIN ""Blockset"" ""B""
-                        ON ""F"".""BlocksetID"" = ""B"".""ID""
+                    LEFT JOIN ""Blockset"" ""B""          ON ""F"".""BlocksetID""    = ""B"".""ID""
+                    LEFT JOIN ""FileVolumeCount"" ""FVC"" ON ""F"".""ID""            = ""FVC"".""FileID""
+                    LEFT JOIN ""FileBestVolume""  ""FBV"" ON ""F"".""ID""            = ""FBV"".""FileID""
+                    LEFT JOIN ""VolumeDensity""   ""VD""  ON ""FBV"".""PrimaryVolID"" = ""VD"".""VolumeID""
                     WHERE ""F"".""BlocksetID"" != {Library.Utility.Utility.FormatInvariantValue(FOLDER_BLOCKSET_ID)}
-                    ORDER BY ""Length"" DESC
+                    ORDER BY
+                        CASE
+                            WHEN ""FVC"".""VolumeCount"" > 1 THEN 1
+                            WHEN ""FVC"".""VolumeCount"" = 1 THEN 2
+                            ELSE 3
+                        END ASC,
+                        CASE WHEN ""FVC"".""VolumeCount"" > 1 THEN ""B"".""Length""          END DESC,
+                        CASE WHEN ""FVC"".""VolumeCount"" > 1 THEN ""FBV"".""PrimaryVolID""  END ASC,
+                        CASE WHEN ""FVC"".""VolumeCount"" = 1 THEN ""VD"".""FileCountInVolume"" END DESC,
+                        CASE WHEN ""FVC"".""VolumeCount"" = 1 THEN ""FBV"".""PrimaryVolID""     END ASC,
+                        IFNULL(""B"".""Length"", 0) DESC,
+                        CASE WHEN ""FVC"".""VolumeCount"" IS NULL AND ""F"".""BlocksetID"" = {str_symlinkblocksetid} THEN 1 ELSE 0 END ASC
                 ")
                     .SetTransaction(m_rtr);
 
