@@ -174,6 +174,12 @@ namespace Duplicati.Library.Main
         private const string DEFAULT_RESTORE_VOLUME_CACHE_MIN_FREE = "1gb";
 
         /// <summary>
+        /// The default threshold for routing shared blocks through the SharedBlockStore.
+        /// A value of 1 means route all blocks referenced by more than 1 file.
+        /// </summary>
+        public const int DEFAULT_RESTORE_SHARED_BLOCK_CACHE_THRESHOLD = 1;
+
+        /// <summary>
         /// The default value for the number of volume decryptors during restore
         /// </summary>
         private static readonly int DEFAULT_RESTORE_VOLUME_DECRYPTORS = Math.Max(1, Environment.ProcessorCount / 2);
@@ -581,6 +587,7 @@ namespace Duplicati.Library.Main
             new CommandLineArgument("restore-preallocate-size", CommandLineArgument.ArgumentType.Boolean, Strings.Options.RestorePreallocateSizeShort, Strings.Options.RestorePreallocateSizeLong, "false"),
             new CommandLineArgument("restore-volume-cache-hint", CommandLineArgument.ArgumentType.Size, Strings.Options.RestoreVolumeCacheHintShort, Strings.Options.RestoreVolumeCacheHintLong, DEFAULT_RESTORE_VOLUME_CACHE_HINT),
             new CommandLineArgument("restore-volume-cache-min-free", CommandLineArgument.ArgumentType.Size, Strings.Options.RestoreVolumeCacheMinFreeShort, Strings.Options.RestoreVolumeCacheMinFreeLong, DEFAULT_RESTORE_VOLUME_CACHE_MIN_FREE),
+            new CommandLineArgument("restore-shared-block-cache-threshold", CommandLineArgument.ArgumentType.Integer, Strings.Options.RestoreSharedBlockCacheThresholdShort, Strings.Options.RestoreSharedBlockCacheThresholdLong, DEFAULT_RESTORE_SHARED_BLOCK_CACHE_THRESHOLD.ToString()),
             new CommandLineArgument("restore-volume-decompressors", CommandLineArgument.ArgumentType.Integer, Strings.Options.RestoreVolumeDecompressorsShort, Strings.Options.RestoreVolumeDecompressorsLong, DEFAULT_RESTORE_VOLUME_DECOMPRESSORS.ToString()),
             new CommandLineArgument("restore-volume-decryptors", CommandLineArgument.ArgumentType.Integer, Strings.Options.RestoreVolumeDecryptorsShort, Strings.Options.RestoreVolumeDecryptorsLong, DEFAULT_RESTORE_VOLUME_DECRYPTORS.ToString()),
             new CommandLineArgument("restore-volume-downloaders", CommandLineArgument.ArgumentType.Integer, Strings.Options.RestoreVolumeDownloadersShort, Strings.Options.RestoreVolumeDownloadersLong, DEFAULT_RESTORE_VOLUME_DOWNLOADERS.ToString()),
@@ -1834,6 +1841,23 @@ namespace Duplicati.Library.Main
         /// </summary>
         public long RestoreVolumeCacheMinFree
             => GetSize("restore-volume-cache-min-free", "gb", DEFAULT_RESTORE_VOLUME_CACHE_MIN_FREE);
+
+        /// <summary>
+        /// Gets the threshold for routing shared blocks through SharedBlockStore during restore.
+        /// 0 = disabled; 1 = route all blocks referenced by more than 1 file; higher = stricter.
+        /// Also disabled when RestoreVolumeCacheHint == 0.
+        /// </summary>
+        public int RestoreSharedBlockCacheThreshold
+        {
+            get
+            {
+                if (!m_options.TryGetValue("restore-shared-block-cache-threshold", out var v))
+                    return DEFAULT_RESTORE_SHARED_BLOCK_CACHE_THRESHOLD;
+                if (!int.TryParse(v, out var result) || result < 0)
+                    throw new ArgumentException("restore-shared-block-cache-threshold must be a non-negative integer");
+                return result;
+            }
+        }
 
         /// <summary>
         /// Gets the number of volume decryptors to use in the restore process

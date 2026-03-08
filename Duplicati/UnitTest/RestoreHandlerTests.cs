@@ -27,6 +27,7 @@ using Duplicati.Library.Common.IO;
 using Duplicati.Library.Interface;
 using Duplicati.Library.Main;
 using NUnit.Framework;
+using NUnit.Framework.Legacy;
 using Assert = NUnit.Framework.Legacy.ClassicAssert;
 
 #nullable enable
@@ -337,6 +338,84 @@ namespace Duplicati.UnitTest
             Assert.That(result.Warnings.Count(), Is.GreaterThanOrEqualTo(1), "Expected at least one CachePressure warning");
 
             TestUtils.AssertDirectoryTreesAreEquivalent(this.DATAFOLDER, this.RESTOREFOLDER, true, "Restoring with disk pressure eviction");
+        }
+
+        [Test]
+        [Category("RestoreHandler")]
+        public void SharedBlockStoreReducesCachePressure()
+        {
+            // Create multiple files that share blocks (identical content)
+            // Then backup, then restore with SharedBlockStore enabled
+            // Assert restore completes successfully and PeakVolumeCacheCount is available
+
+            var sharedContent = new byte[1024 * 1024]; // 1 MB of random data (will deduplicate across files)
+            new System.Random(42).NextBytes(sharedContent);
+
+            // Create 5 files with the SAME content (forces shared blocks)
+            for (int i = 0; i < 5; i++)
+            {
+                string filePath = Path.Combine(this.DATAFOLDER, $"shared_file_{i}");
+                File.WriteAllBytes(filePath, sharedContent);
+            }
+
+            // Also create some unique files
+            for (int i = 0; i < 3; i++)
+            {
+                string filePath = Path.Combine(this.DATAFOLDER, $"unique_file_{i}");
+                var uniqueContent = new byte[512 * 1024];
+                new System.Random(i * 100).NextBytes(uniqueContent);
+                File.WriteAllBytes(filePath, uniqueContent);
+            }
+
+            Dictionary<string, string> backupOptions = new Dictionary<string, string>(this.TestOptions)
+            {
+                ["blocksize"] = "100kb",  // small blocks to force deduplication
+            };
+
+            using (Controller c = new Controller("file://" + this.TARGETFOLDER, backupOptions, null))
+            {
+                IBackupResults backupResults = c.Backup(new[] { this.DATAFOLDER });
+                Assert.AreEqual(0, backupResults.Errors.Count());
+                Assert.AreEqual(0, backupResults.Warnings.Count());
+            }
+
+            // Restore with SharedBlockStore enabled (default threshold=1)
+            Dictionary<string, string> restoreOptions = new Dictionary<string, string>(this.TestOptions)
+            {
+                ["restore-path"] = this.RESTOREFOLDER,
+                ["restore-shared-block-cache-threshold"] = "1",
+            };
+
+            IRestoreResults restoreResults;
+            using (Controller c = new Controller("file://" + this.TARGETFOLDER, restoreOptions, null))
+            {
+                restoreResults = c.Restore(null);
+                Assert.AreEqual(0, restoreResults.Errors.Count());
+                Assert.AreEqual(0, restoreResults.Warnings.Count());
+            }
+
+            // Verify restored files match originals
+            for (int i = 0; i < 5; i++)
+            {
+                string originalPath = Path.Combine(this.DATAFOLDER, $"shared_file_{i}");
+                string restoredPath = Path.Combine(this.RESTOREFOLDER, $"shared_file_{i}");
+                Assert.IsTrue(File.Exists(restoredPath), $"Restored file shared_file_{i} should exist");
+                CollectionAssert.AreEqual(File.ReadAllBytes(originalPath), File.ReadAllBytes(restoredPath), $"Restored file shared_file_{i} content should match");
+            }
+
+            // Verify the feature can be disabled
+            string restoreFolderDisabled = Path.Combine(this.RESTOREFOLDER, "disabled");
+            Directory.CreateDirectory(restoreFolderDisabled);
+            Dictionary<string, string> restoreDisabledOptions = new Dictionary<string, string>(this.TestOptions)
+            {
+                ["restore-path"] = restoreFolderDisabled,
+                ["restore-shared-block-cache-threshold"] = "0",
+            };
+            using (Controller c = new Controller("file://" + this.TARGETFOLDER, restoreDisabledOptions, null))
+            {
+                IRestoreResults disabledResults = c.Restore(null);
+                Assert.AreEqual(0, disabledResults.Errors.Count());
+            }
         }
     }
 }

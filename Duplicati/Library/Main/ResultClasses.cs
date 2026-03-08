@@ -558,6 +558,24 @@ namespace Duplicati.Library.Main
         public long TotalVolumesAccessed { get; internal set; }
         public bool ShouldSerializeTotalVolumesAccessed() => TotalVolumesAccessed > 0;
 
+        /// <summary>
+        /// Peak number of volumes simultaneously in VolumeManager.cache.
+        /// </summary>
+        public long PeakVolumeCacheCount { get; internal set; }
+        public bool ShouldSerializePeakVolumeCacheCount() => PeakVolumeCacheCount > 0;
+
+        /// <summary>
+        /// Peak bytes simultaneously in VolumeManager.cache.
+        /// </summary>
+        public long PeakVolumeCacheBytes { get; internal set; }
+        public bool ShouldSerializePeakVolumeCacheBytes() => PeakVolumeCacheBytes > 0;
+
+        /// <summary>
+        /// Peak bytes written to the SharedBlockStore TempFile(s).
+        /// </summary>
+        public long PeakSharedBlockStoreBytes { get; internal set; }
+        public bool ShouldSerializePeakSharedBlockStoreBytes() => PeakSharedBlockStoreBytes > 0;
+
         public override OperationMode MainOperation { get { return OperationMode.Restore; } }
 
         public IRecreateDatabaseResults RecreateDatabaseResults { get; internal set; }

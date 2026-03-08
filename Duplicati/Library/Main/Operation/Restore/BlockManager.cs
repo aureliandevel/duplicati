@@ -49,21 +49,39 @@ namespace Duplicati.Library.Main.Operation.Restore
         private static readonly string LOGTAG = Logging.Log.LogTagFromType<BlockManager>();
 
         /// <summary>
-        /// Dictionary for data blocks that are being cached. Whenever a block
-        /// is requested, it checks if it is in the cache. If it is not, it
-        /// will request the block from the corresponding volume. The requester
-        /// will be given a `Task` that will be completed when the block is
-        /// available. The cache will also keep track of how many times a block
-        /// is requested, and only remove it from the cache when all requests
-        /// have been fulfilled. This is to ensure that the cache is not
-        /// prematurely evicted, while keeping the memory usage low. The
-        /// dictionary also keeps track of how many readers are accessing it,
-        /// and will retire the volume request channel when the last reader is
-        /// done. Once disposed, the dictionary will clean up the database
-        /// table that was used to keep track of the block counts.
+        /// Manages block caching for restore operations with dual-path storage strategy.
+        /// Blocks referenced by multiple volumes (above threshold) are routed to a SharedBlockStore
+        /// for cross-volume reuse, while other blocks use a MemoryCache with per-volume tracking.
+        /// Requesters receive a <c>Task</c> that completes when the block is available.
+        /// Reference counting ensures blocks remain cached until all requests are fulfilled,
+        /// and volume request channels are retired when the last reader completes.
         /// </summary>
         internal class SleepableDictionary : IDisposable
         {
+            /// <summary>
+            /// Lifecycle state for shared blocks accessed under m_blockcount_lock.<br/>
+            /// Tracks whether blocks referenced by multiple volumes should use the SharedBlockStore or fall back to normal caching.<br/>
+            /// State transitions are one-way: Pending -> (Stored | Bypassed).
+            /// </summary>
+            private enum SharedBlockState { 
+                /// <summary>
+                /// Block not yet stored. First request triggers download/store; subsequent requests wait in m_shared_waiters.
+                /// </summary>
+                Pending, 
+
+                /// <summary>
+                /// Block successfully stored in SharedBlockStore. All requests retrieve from shared storage. Volume count is decremented 
+                /// by all remaining references at once upon store completion.
+                /// </summary>
+                Stored, 
+
+                /// <summary>
+                /// Block failed to store (free-space check or budget limit exceeded). Requests fall back to normal cache path with 
+                /// per-reference volume count decrements.
+                /// </summary>
+                Bypassed 
+            }
+
             /// <summary>
             /// Channel for submitting block requests from a volume.
             /// </summary>
@@ -152,11 +170,52 @@ namespace Duplicati.Library.Main.Operation.Restore
             private bool m_retired = false;
 
             /// <summary>
+            /// The shared block store for cross-volume blocks.
+            /// </summary>
+            private readonly SharedBlockStore m_shared_block_store;
+            /// <summary>
+            /// Set of block IDs that are candidates for the shared-block path.
+            /// </summary>
+            private readonly HashSet<long> m_shared_blocks;
+            /// <summary>
+            /// Lifecycle state per shared block. Access under m_blockcount_lock.
+            /// </summary>
+            private readonly Dictionary<long, SharedBlockState> m_shared_block_state;
+            /// <summary>
+            /// Waiter tasks for callers of Get() while a shared block is Pending. Access under m_blockcount_lock.
+            /// </summary>
+            private readonly Dictionary<long, (int Count, TaskCompletionSource<DataBlock> Task)> m_shared_waiters;
+            /// <summary>
+            /// Temp directory path used for free-space probes in unlimited mode.
+            /// </summary>
+            private readonly string m_temp_dir;
+
+            /// <summary>
+            /// Last observed free space in the shared storage path. Used to trigger proactive bypass of the shared-block path when space is low.
+            /// </summary>
+            private long m_last_free_space_bytes = long.MaxValue;
+            /// <summary>
+            /// Cumulative bytes written to the SharedBlockStore since the last free space check. Used to trigger periodic re-checks.
+            /// </summary>
+            private long m_last_free_space_check_bytes_written = 0L;
+            /// <summary>
+            /// Cumulative bytes written to the SharedBlockStore. Used for monitoring and logging.
+            /// </summary>
+            private long m_bytes_written_to_shared = 0L;
+            /// <summary>
+            /// Flag to avoid spamming logs with free space probe failures.
+            /// </summary>
+            private bool m_free_space_probe_failed_logged = false;
+
+            /// <summary>
             /// Initializes a new instance of the <see cref="SleepableDictionary"/> class.
             /// </summary>
             /// <param name="volume_request">Channel for submitting block requests from a volume.</param>
             /// <param name="readers">Number of readers accessing this dictionary. Used during shutdown / cleanup.</param>
-            private SleepableDictionary(IWriteChannel<object> volume_request, Options options, int readers)
+            /// <param name="shared_blocks">Set of block IDs that are candidates for SharedBlockStore routing.</param>
+            /// <param name="shared_block_store">The SharedBlockStore instance for routing shared blocks.</param>
+            private SleepableDictionary(IWriteChannel<object> volume_request, Options options, int readers,
+                HashSet<long> shared_blocks, SharedBlockStore shared_block_store)
             {
                 m_options = options;
                 m_volume_request = volume_request;
@@ -191,11 +250,19 @@ namespace Duplicati.Library.Main.Operation.Restore
                 sw_set_set = options.InternalProfiling ? new() : null;
                 sw_set_wake_get = options.InternalProfiling ? new() : null;
                 sw_set_wake_set = options.InternalProfiling ? new() : null;
+
+                m_shared_blocks = shared_blocks;
+                m_shared_block_state = shared_blocks.ToDictionary(x => x, _ => SharedBlockState.Pending);
+                m_shared_waiters = [];
+                m_shared_block_store = shared_block_store;
+                m_temp_dir = options.TempDir ?? System.IO.Path.GetTempPath();
             }
 
             /// <summary>
             /// Asynchronously creates a new instance of the <see cref="SleepableDictionary"/> class.
-            /// This method initializes the block and volume counts based on the data in the database.
+            /// Initializes block and volume counts from the database, identifies high-reference-count blocks
+            /// for SharedBlockStore routing (based on <see cref="Options.RestoreSharedBlockCacheThreshold"/>),
+            /// and configures the dual-path caching strategy with allocated budgets.
             /// </summary>
             /// <param name="db">The database holding information about how many of each block this restore requires.</param>
             /// <param name="volume_request">CoCoL channel for submitting block requests from a volume.</param>
@@ -205,16 +272,45 @@ namespace Duplicati.Library.Main.Operation.Restore
             /// <returns>A task that when awaited returns a new instance of the <see cref="SleepableDictionary"/> class.</returns>
             public static async Task<SleepableDictionary> CreateAsync(LocalRestoreDatabase db, IWriteChannel<object> volume_request, Options options, int readers, CancellationToken cancellationToken)
             {
-                var sd = new SleepableDictionary(volume_request, options, readers);
+
+                var blockcount = new Dictionary<long, long>();
+                var volumecount = new Dictionary<long, long>();
 
                 await foreach (var (block_id, volume_id) in db.GetBlocksAndVolumeIDs(options.SkipMetadata, cancellationToken).ConfigureAwait(false))
                 {
-                    var bc = sd.m_blockcount.TryGetValue(block_id, out var c);
-                    sd.m_blockcount[block_id] = bc ? c + 1 : 1;
-                    var vc = sd.m_volumecount.TryGetValue(volume_id, out var v);
-                    sd.m_volumecount[volume_id] = vc ? v + 1 : 1;
+                    blockcount[block_id] = blockcount.TryGetValue(block_id, out var c) ? c + 1 : 1;
+                    volumecount[volume_id] = volumecount.TryGetValue(volume_id, out var v) ? v + 1 : 1;
                 }
 
+                int threshold = options.RestoreSharedBlockCacheThreshold;
+                var shared_blocks = new HashSet<long>();
+                var shared_block_store = SharedBlockStore.Empty;
+
+                if (options.RestoreVolumeCacheHint != 0 && threshold > 0)
+                {
+                    foreach (var (block_id, count) in blockcount)
+                        if (count > threshold)
+                            shared_blocks.Add(block_id);
+
+                    if (shared_blocks.Count > 0)
+                    {
+                        long store_budget = options.RestoreVolumeCacheHint > 0
+                            ? RestoreCacheBudget.GetSharedBlockStoreBudget(options.RestoreVolumeCacheHint)
+                            : -1L;
+                        shared_block_store = new SharedBlockStore(options.TempDir ?? System.IO.Path.GetTempPath(), store_budget);
+                    }
+
+                    Logging.Log.WriteExplicitMessage(LOGTAG, "SharedBlockStore",
+                        "SharedBlockStore initialized: {0} shared blocks (threshold={1}).",
+                        shared_blocks.Count, threshold);
+                }
+
+                var sd = new SleepableDictionary(volume_request, options, readers, shared_blocks, shared_block_store);
+
+                foreach (var (block_id, count) in blockcount)
+                    sd.m_blockcount[block_id] = count;
+                foreach (var (volume_id, count) in volumecount)
+                    sd.m_volumecount[volume_id] = count;
                 foreach (var kvp in sd.m_volumecount)
                     sd.m_volumecount_initial[kvp.Key] = kvp.Value;
 
@@ -229,10 +325,16 @@ namespace Duplicati.Library.Main.Operation.Restore
             }
 
             /// <summary>
-            /// Decrements the block counters for the block and volume, and checks
-            /// if the block is still needed. If the block is no longer needed, it
-            /// will be removed from the cache. If the volume is no longer needed,
-            /// the VolumeDownloader will be notified.
+            /// Peak bytes written to the SharedBlockStore TempFile(s).
+            /// </summary>
+            public long PeakSharedBlockStoreBytes => m_shared_block_store.PeakBytesWritten;
+
+            /// <summary>
+            /// Decrements block and volume reference counters after a block has been consumed.
+            /// When a block's count reaches zero, it's removed from caches and SharedBlockStore references are decremented.
+            /// Volume counts are only decremented for non-Stored shared blocks (Stored blocks had their volume counts
+            /// pre-decremented in <see cref="Set"/>). When a volume's count reaches zero, a CacheEvict notification
+            /// is sent to the VolumeDownloader.
             /// </summary>
             /// <param name="blockRequest">The block request to check.</param>
             public async Task CheckCounts(BlockRequest blockRequest)
@@ -249,45 +351,72 @@ namespace Duplicati.Library.Main.Operation.Restore
                 {
                     sw_checkcounts?.Start();
 
-                    var block_count = m_blockcount.TryGetValue(blockRequest.BlockID, out var c) ? c - 1 : 0;
+                    var shared_state = m_shared_block_state.TryGetValue(blockRequest.BlockID, out var ss)
+                        ? ss
+                        : (SharedBlockState?)null;
 
-                    if (block_count > 0)
+                    if (m_blockcount.TryGetValue(blockRequest.BlockID, out var c))
                     {
-                        m_blockcount[blockRequest.BlockID] = block_count;
+                        var block_count = c - 1;
+
+                        if (block_count > 0)
+                        {
+                            m_blockcount[blockRequest.BlockID] = block_count;
+                        }
+                        else if (block_count == 0)
+                        {
+                            m_blockcount.Remove(blockRequest.BlockID);
+                            m_block_cache.Remove(blockRequest.BlockID);
+                            if (shared_state == SharedBlockState.Stored)
+                                m_shared_block_store.Decrement(blockRequest.BlockID);
+                            m_shared_block_state.Remove(blockRequest.BlockID);
+                        }
+                        else // block_count < 0
+                        {
+                            error_block_id = blockRequest.BlockID;
+                        }
                     }
-                    else if (block_count == 0)
-                    {
-                        // Evict the block from the cache and check if the volume is no longer needed.
-                        m_blockcount.Remove(blockRequest.BlockID);
-                        m_block_cache.Remove(blockRequest.BlockID);
-                    }
-                    else // block_count < 0
+                    else
                     {
                         error_block_id = blockRequest.BlockID;
                     }
 
-                    var vol_count = m_volumecount.TryGetValue(blockRequest.VolumeID, out var vc) ? vc - 1 : 0;
-                    if (vol_count > 0)
+                    // Only decrement volume count for non-Stored shared blocks.
+                    // When a block is Stored, Set() already decremented the volume count
+                    // by all remaining references at once.
+                    if (shared_state != SharedBlockState.Stored)
                     {
-                        m_volumecount[blockRequest.VolumeID] = vol_count;
-                        if (m_volumecount_initial.TryGetValue(blockRequest.VolumeID, out var vi) && vi > 0)
+                        if (m_volumecount.TryGetValue(blockRequest.VolumeID, out var vc))
                         {
-                            vol_initial = vi;
-                            vol_count_after = vol_count;
-                            vol_milestone = (vol_count * 10 / vi) != ((vol_count + 1) * 10 / vi);
+                            var vol_count = vc - 1;
+                            if (vol_count > 0)
+                            {
+                                m_volumecount[blockRequest.VolumeID] = vol_count;
+                                if (m_volumecount_initial.TryGetValue(blockRequest.VolumeID, out var vi) && vi > 0)
+                                {
+                                    vol_initial = vi;
+                                    vol_count_after = vol_count;
+                                    vol_milestone = (vol_count * 10 / vi) != ((vol_count + 1) * 10 / vi);
+                                }
+                            }
+                            else if (vol_count == 0)
+                            {
+                                m_volumecount_initial.TryGetValue(blockRequest.VolumeID, out vol_initial);
+                                m_volumecount.Remove(blockRequest.VolumeID);
+                                blockRequest.RequestType = BlockRequestType.CacheEvict;
+                                emit_evict = true;
+                            }
+                            else // vol_count < 0
+                            {
+                                error_volume_id = blockRequest.VolumeID;
+                            }
+                        }
+                        else
+                        {
+                            error_volume_id = blockRequest.VolumeID;
                         }
                     }
-                    else if (vol_count == 0)
-                    {
-                        m_volumecount_initial.TryGetValue(blockRequest.VolumeID, out vol_initial);
-                        m_volumecount.Remove(blockRequest.VolumeID);
-                        blockRequest.RequestType = BlockRequestType.CacheEvict;
-                        emit_evict = true;
-                    }
-                    else // vol_count < 0
-                    {
-                        error_volume_id = blockRequest.VolumeID;
-                    }
+
                     sw_checkcounts?.Stop();
                 }
                 Logging.Log.WriteExplicitMessage(LOGTAG, "CheckCounts", "Released m_blockcount_lock for block {0}", blockRequest.BlockID);
@@ -318,9 +447,9 @@ namespace Duplicati.Library.Main.Operation.Restore
             }
 
             /// <summary>
-            /// Get a block from the cache. If the block is not in the cache,
-            /// it will request the block from the volume and return a `Task`
-            /// that will be completed when the block is available.
+            /// Get a block from the cache (or shared store). If the block is not available,
+            /// it requests the block from the volume and returns a Task that completes when
+            /// the block is available.
             /// </summary>
             /// <param name="block_request">The requested block.</param>
             /// <returns>A `Task` holding the data block.</returns>
@@ -328,7 +457,70 @@ namespace Duplicati.Library.Main.Operation.Restore
             {
                 Logging.Log.WriteExplicitMessage(LOGTAG, "BlockCacheGet", "Getting block {0} from cache", block_request.BlockID);
 
-                // Check if the block is already in the cache, and return it if it is.
+                // ---- Shared-block fast path ----
+                if (m_shared_blocks.Contains(block_request.BlockID))
+                {
+                    SharedBlockState state;
+                    TaskCompletionSource<DataBlock>? waiter = null;
+                    bool issue_download = false;
+
+                    lock (m_blockcount_lock)
+                    {
+                        state = m_shared_block_state.TryGetValue(block_request.BlockID, out var s) ? s : SharedBlockState.Pending;
+                        if (state == SharedBlockState.Pending)
+                        {
+                            if (m_shared_waiters.TryGetValue(block_request.BlockID, out var existing))
+                            {
+                                m_shared_waiters[block_request.BlockID] = (existing.Count + 1, existing.Task);
+                                waiter = existing.Task;
+                            }
+                            else
+                            {
+                                waiter = new TaskCompletionSource<DataBlock>(TaskCreationOptions.RunContinuationsAsynchronously);
+                                m_shared_waiters[block_request.BlockID] = (1, waiter);
+                                issue_download = true;
+                            }
+                        }
+                    }
+
+                    if (state == SharedBlockState.Stored)
+                    {
+                        var read_result = m_shared_block_store.TryGet(block_request.BlockID, out var shared_data);
+                        if (read_result == SharedBlockStoreReadResult.Hit)
+                            return shared_data!;
+
+                        if (read_result == SharedBlockStoreReadResult.ReadFailure)
+                        {
+                            // Roll back: mark Bypassed and restore volumecount so the normal eviction path works.
+                            lock (m_blockcount_lock)
+                            {
+                                if (m_shared_block_state.TryGetValue(block_request.BlockID, out var current)
+                                    && current == SharedBlockState.Stored)
+                                {
+                                    var remaining = m_blockcount.TryGetValue(block_request.BlockID, out var r) ? r : 0;
+                                    if (remaining > 0)
+                                        m_volumecount[block_request.VolumeID] = m_volumecount.TryGetValue(block_request.VolumeID, out var vc)
+                                            ? vc + remaining
+                                            : remaining;
+                                    m_shared_block_state[block_request.BlockID] = SharedBlockState.Bypassed;
+                                    m_shared_block_store.Decrement(block_request.BlockID);
+                                }
+                            }
+                        }
+                        // Fall through to normal path after rollback.
+                    }
+                    else if (state == SharedBlockState.Pending)
+                    {
+                        if (issue_download)
+                            await m_volume_request.WriteAsync(block_request).ConfigureAwait(false);
+                        return await waiter!.Task.ConfigureAwait(false);
+                    }
+                    // state == Bypassed: fall through to normal path below.
+                }
+
+                // ---- Normal path ----
+
+                // Check if the block is already in the MemoryCache.
                 if (m_block_cache.TryGetValue(block_request.BlockID, out DataBlock? value))
                 {
                     if (value is null)
@@ -376,25 +568,177 @@ namespace Duplicati.Library.Main.Operation.Restore
             }
 
             /// <summary>
-            /// Set a block in the cache. If the block is already in the cache,
-            /// it will be replaced. If the block is not in the cache, it will
-            /// be added. If the block is no longer needed, it will be removed
-            /// from the cache. If the block is requested while it is being
-            /// removed, the requester will be given a `Task` that will be
-            /// completed when the block is available.
+            /// Stores a block in the shared store or the MemoryCache, completing any waiters.
+            /// Returns a CacheEvict BlockRequest if the volume is now fully consumed (shared path only),
+            /// or null otherwise.
             /// </summary>
-            /// <param name="blockRequest">The block request related to the value.</param>
-            /// <param name="value">The byte[] buffer holding the block data.</param>
-            public void Set(long blockID, DataBlock value)
+            /// <param name="block_request">The block request related to the value.</param>
+            /// <param name="value">The data block to store.</param>
+            /// <returns>A <see cref="BlockRequest"/> with type <see cref="BlockRequestType.CacheEvict"/> if the volume is now fully consumed via the shared-block path; otherwise <c>null</c>.</returns>
+            public BlockRequest? Set(BlockRequest block_request, DataBlock value)
             {
+                // Free-space check thresholds for unlimited mode
+                const int FREE_SPACE_THRESHOLD_MULTIPLIER = 4;
+                const long FREE_SPACE_CHECK_INTERVAL_BYTES = 256L * 1024 * 1024; // 256 MB
+
+                var blockID = block_request.BlockID;
                 Logging.Log.WriteExplicitMessage(LOGTAG, "BlockCacheSet", "Setting block {0} in cache", blockID);
 
+                if (m_shared_blocks.Contains(blockID))
+                {
+                    bool try_store = false;
+
+                    lock (m_blockcount_lock)
+                    {
+                        var current_state = m_shared_block_state.TryGetValue(blockID, out var s) ? s : SharedBlockState.Pending;
+
+                        // Idempotency guard: already handled by a previous Set() call.
+                        if (current_state != SharedBlockState.Pending)
+                            return null;
+
+                        // In unlimited mode, check free space adaptively.
+                        if (m_options.RestoreVolumeCacheHint < 0)
+                        {
+                            bool do_check = m_last_free_space_bytes < FREE_SPACE_THRESHOLD_MULTIPLIER * m_options.RestoreVolumeCacheMinFree
+                                || m_bytes_written_to_shared - m_last_free_space_check_bytes_written >= FREE_SPACE_CHECK_INTERVAL_BYTES;
+
+                            if (do_check)
+                            {
+                                var fs = Library.Utility.Utility.GetFreeSpaceForPath(m_temp_dir);
+                                if (fs == null)
+                                {
+                                    if (!m_free_space_probe_failed_logged)
+                                    {
+                                        m_free_space_probe_failed_logged = true;
+                                        Logging.Log.WriteWarningMessage(LOGTAG, "SharedFreeSpaceProbe", null,
+                                            "Unable to determine free space in '{0}'; bypassing shared-block storage for block {1}.", m_temp_dir, blockID);
+                                    }
+                                    m_shared_block_state[blockID] = SharedBlockState.Bypassed;
+                                    current_state = SharedBlockState.Bypassed;
+                                }
+                                else
+                                {
+                                    m_last_free_space_bytes = fs.Value.FreeSpace;
+                                    m_last_free_space_check_bytes_written = m_bytes_written_to_shared;
+
+                                    if (m_last_free_space_bytes < m_options.RestoreVolumeCacheMinFree)
+                                    {
+                                        m_shared_block_state[blockID] = SharedBlockState.Bypassed;
+                                        current_state = SharedBlockState.Bypassed;
+
+                                        // TODO Probably want to change id to something common, but also
+                                        // wondering if this should be raised to a verbose?
+                                        Logging.Log.WriteExplicitMessage(LOGTAG, "SharedFreeSpaceLow",
+                                            "Free space ({0} bytes) below minimum ({1} bytes); bypassing shared-block storage for block {2}.",
+                                            m_last_free_space_bytes, m_options.RestoreVolumeCacheMinFree, blockID);
+                                    }
+                                }
+                            }
+                        }
+                        // In explicit-size mode, the SharedBlockStore.Add budget check handles the limit.
+
+                        if (current_state == SharedBlockState.Pending)
+                            try_store = true;
+                    }
+
+                    if (try_store)
+                    {
+                        bool stored = m_shared_block_store.Add(blockID, value.Data!.AsSpan(0, (int)block_request.BlockSize));
+
+                        if (stored)
+                        {
+                            BlockRequest? evict_request = null;
+
+                            lock (m_blockcount_lock)
+                            {
+                                m_shared_block_state[blockID] = SharedBlockState.Stored;
+                                var remaining = m_blockcount.TryGetValue(blockID, out var r) ? r : 0L;
+                                m_bytes_written_to_shared += block_request.BlockSize;
+
+                                // Decrement the volume count by ALL remaining block-references at once.
+                                // This mirrors what CheckCounts would do one-by-one for each caller.
+                                var vol_count_before = m_volumecount.TryGetValue(block_request.VolumeID, out var vc) ? vc : 0L;
+                                var vol_count = vol_count_before - remaining;
+
+                                if (vol_count > 0)
+                                {
+                                    m_volumecount[block_request.VolumeID] = vol_count;
+                                    if (m_volumecount_initial.TryGetValue(block_request.VolumeID, out var vi) && vi > 0)
+                                    {
+                                        bool vol_milestone = (vol_count * 10 / vi) != ((vol_count + 1) * 10 / vi);
+                                        if (vol_milestone)
+                                            Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeBlockCount",
+                                                "Volume {0}: {1}/{2} block-references remaining ({3}%) [shared-block shortcut]",
+                                                block_request.VolumeID, vol_count, vi, vol_count * 100 / vi);
+                                    }
+                                }
+                                else
+                                {
+                                    m_volumecount_initial.TryGetValue(block_request.VolumeID, out var vol_initial);
+                                    m_volumecount.Remove(block_request.VolumeID);
+                                    Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeBlockCount",
+                                        "Volume {0} fully consumed via shared-block shortcut ({1} block-references). {2} volumes still tracked.",
+                                        block_request.VolumeID, vol_initial, m_volumecount.Count);
+                                    evict_request = new BlockRequest(
+                                        block_request.BlockID,
+                                        block_request.BlockOffset,
+                                        block_request.BlockHash,
+                                        block_request.BlockSize,
+                                        block_request.VolumeID,
+                                        BlockRequestType.CacheEvict);
+                                }
+
+                                // Complete all waiters that were waiting for this shared block.
+                                if (m_shared_waiters.Remove(blockID, out var entry))
+                                {
+                                    value.Reference(entry.Count);
+                                    entry.Task.SetResult(value);
+                                }
+                            }
+
+                            // Dispose the producer's reference; the waiters' references keep the data alive.
+                            value.Dispose();
+                            return evict_request;
+                        }
+                        else
+                        {
+                            // Add failed — mark Bypassed and fall through to the normal path.
+                            lock (m_blockcount_lock)
+                            {
+                                m_shared_block_state[blockID] = SharedBlockState.Bypassed;
+                            }
+                        }
+                    }
+                    // Either was already Bypassed or the Add failed: fall through to normal Set below.
+                }
+
+                // ---- Normal (non-shared or bypassed-shared) path ----
+
                 sw_set_wake_get?.Start();
-                var waiters_exist = m_waiters.TryRemove(blockID, out var entry);
+                var waiters_exist = m_waiters.TryRemove(blockID, out var normal_entry);
                 sw_set_wake_get?.Stop();
 
+                // Also pick up any shared waiters that were registered before the bypass was decided.
+                bool shared_waiters_exist = false;
+                (int Count, TaskCompletionSource<DataBlock> Task) shared_entry = default;
+                if (m_shared_blocks.Contains(blockID))
+                {
+                    lock (m_blockcount_lock)
+                    {
+                        shared_waiters_exist = m_shared_waiters.Remove(blockID, out shared_entry);
+                    }
+                }
+
+                int total_waiters = (waiters_exist ? normal_entry.Count : 0) + (shared_waiters_exist ? shared_entry.Count : 0);
+                bool any_waiters = waiters_exist || shared_waiters_exist;
+
                 sw_set_set?.Start();
-                bool fullfills = waiters_exist && entry.Count >= m_blockcount[blockID];
+                long blockcount_val;
+                lock (m_blockcount_lock)
+                {
+                    blockcount_val = m_blockcount.TryGetValue(blockID, out var bc) ? bc : 0L;
+                }
+                bool fullfills = any_waiters && total_waiters >= blockcount_val;
                 bool added_to_cache = !fullfills && m_block_cache_max > 0;
                 if (added_to_cache)
                 {
@@ -405,10 +749,13 @@ namespace Duplicati.Library.Main.Operation.Restore
 
                 // Notify any waiters that the block is available.
                 sw_set_wake_set?.Start();
-                if (waiters_exist)
+                if (any_waiters)
                 {
-                    value.Reference(entry.Count);
-                    entry.Task.SetResult(value);
+                    value.Reference(total_waiters);
+                    if (waiters_exist)
+                        normal_entry.Task.SetResult(value);
+                    if (shared_waiters_exist)
+                        shared_entry.Task!.SetResult(value);
                 }
                 sw_set_wake_set?.Stop();
 
@@ -419,9 +766,10 @@ namespace Duplicati.Library.Main.Operation.Restore
                         m_block_cache.Compact(m_options.RestoreCacheEvict);
                 }
                 else
-                    // This method is responsible for the disposal
                     value.Dispose();
                 sw_cacheevict?.Stop();
+
+                return null;
             }
 
             /// <summary>
@@ -486,6 +834,8 @@ namespace Duplicati.Library.Main.Operation.Restore
                     m_retired = true;
                     m_volume_request.Retire();
                 }
+
+                m_shared_block_store.Dispose();
             }
 
             /// <summary>
@@ -498,16 +848,23 @@ namespace Duplicati.Library.Main.Operation.Restore
                 {
                     tcs.SetException(new RetiredException("Request waiter"));
                 }
+
+                // Also cancel any pending shared waiters.
+                lock (m_blockcount_lock)
+                {
+                    foreach (var (_, entry) in m_shared_waiters)
+                        entry.Task.TrySetException(new RetiredException("Shared request waiter"));
+                    m_shared_waiters.Clear();
+                }
             }
         }
 
         /// <summary>
-        /// Run the block manager process. This will create a cache for the
-        /// blocks, and start two tasks: one for reading blocks from the input
-        /// channel (data blocks from the volumes) and storing them in the
-        /// cache, and one for reading block requests from the `FileProcessor`,
-        /// accessing the cache for the blocks, and writing the resulting
-        /// blocks back to the `FileProcessor`.
+        /// Runs the block manager process with dual-path caching strategy.
+        /// Creates a <see cref="SleepableDictionary"/> that routes high-reference-count blocks to SharedBlockStore
+        /// and other blocks to MemoryCache. Starts a volume consumer task (reads decompressed blocks from volumes
+        /// and stores them) and multiple block handler tasks (one per FileProcessor worker, serving block requests
+        /// by retrieving from cache or requesting from volumes).
         /// </summary>
         /// <param name="channels">The named channels for the restore operation.</param>
         /// <param name="db">The database holding information about how many of each block this restore requires.</param>
@@ -548,13 +905,19 @@ namespace Duplicati.Library.Main.Operation.Restore
 
                             Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeConsumer", null, "Received data for block {0} from volume {1}", block_request.BlockID, block_request.VolumeID);
                             sw_set?.Start();
-                            cache.Set(block_request.BlockID, data);
+                            var evict = cache.Set(block_request, data);
                             sw_set?.Stop();
 
                             Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeConsumer", null, "Updating deadlock timer for block {0} from volume {1}", block_request.BlockID, block_request.VolumeID);
                             sw_deadlock?.Start();
                             DeadlockTimer.MaxProcessingTime = Math.Max(DeadlockTimer.MaxProcessingTime, (int)(DateTime.Now - block_request.TimestampMilliseconds).TotalMilliseconds);
                             sw_deadlock?.Stop();
+
+                            if (evict != null)
+                            {
+                                Logging.Log.WriteExplicitMessage(LOGTAG, "VolumeConsumer", null, "Emitting eviction request for volume {0}", evict.VolumeID);
+                                await self.Output.WriteAsync(evict).ConfigureAwait(false);
+                            }
                         }
                     }
                     catch (RetiredException)
@@ -642,8 +1005,9 @@ namespace Duplicati.Library.Main.Operation.Restore
                 })).ToArray();
 
                 await Task.WhenAll([volume_consumer, .. block_handlers]).ConfigureAwait(false);
+
+                results.PeakSharedBlockStoreBytes = cache.PeakSharedBlockStoreBytes;
             });
         }
     }
-
 }
