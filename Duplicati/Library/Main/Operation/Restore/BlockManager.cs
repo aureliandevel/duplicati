@@ -485,7 +485,11 @@ namespace Duplicati.Library.Main.Operation.Restore
 
                     if (state == SharedBlockState.Stored)
                     {
-                        var read_result = m_shared_block_store.TryGet(block_request.BlockID, out var shared_data);
+                        long remaining_reference_count;
+                        lock (m_blockcount_lock)
+                            remaining_reference_count = m_blockcount.TryGetValue(block_request.BlockID, out var block_count) ? block_count : 0L;
+
+                        var read_result = m_shared_block_store.TryGet(block_request.BlockID, remaining_reference_count, out var shared_data);
                         if (read_result == SharedBlockStoreReadResult.Hit)
                             return shared_data!;
 
@@ -643,7 +647,11 @@ namespace Duplicati.Library.Main.Operation.Restore
 
                     if (try_store)
                     {
-                        bool stored = m_shared_block_store.Add(blockID, value.Data!.AsSpan(0, (int)block_request.BlockSize));
+                        long reference_count;
+                        lock (m_blockcount_lock)
+                            reference_count = m_blockcount.TryGetValue(blockID, out var block_count) ? block_count : 0L;
+
+                        bool stored = m_shared_block_store.Add(blockID, value.Data!.AsSpan(0, (int)block_request.BlockSize), reference_count);
 
                         if (stored)
                         {

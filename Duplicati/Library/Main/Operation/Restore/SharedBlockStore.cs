@@ -283,6 +283,19 @@ namespace Duplicati.Library.Main.Operation.Restore
         /// an I/O error occurred, or the instance is disposed.
         /// </returns>
         public bool Add(long blockID, ReadOnlySpan<byte> data)
+            => Add(blockID, data, referenceCount: null);
+
+        /// <summary>
+        /// Adds a block to the store.
+        /// </summary>
+        /// <param name="blockID">The block's database ID (used as the key).</param>
+        /// <param name="data">The block data to persist.</param>
+        /// <param name="referenceCount">The number of outstanding references for the block, when known.</param>
+        /// <returns>
+        /// <c>true</c> on success; <c>false</c> if the store is full, the budget is exhausted,
+        /// an I/O error occurred, or the instance is disposed.
+        /// </returns>
+        public bool Add(long blockID, ReadOnlySpan<byte> data, long? referenceCount)
         {
             if (m_isEmpty || m_disposed)
                 return false;
@@ -347,9 +360,18 @@ namespace Duplicati.Library.Main.Operation.Restore
                     m_index[blockID] = (fileIndex, offset, length);
                 }
 
-                Logging.Log.WriteExplicitMessage(LOGTAG, "SharedBlockStore",
-                    "SharedBlockStore: block {0} stored at file={1}, offset={2}, length={3}",
-                    blockID, fileIndex, offset, length);
+                if (referenceCount.HasValue)
+                {
+                    Logging.Log.WriteExplicitMessage(LOGTAG, "SharedBlockStore",
+                        "SharedBlockStore: block {0} stored at file={1}, offset={2}, length={3}, ref_count={4}",
+                        blockID, fileIndex, offset, length, referenceCount.Value);
+                }
+                else
+                {
+                    Logging.Log.WriteExplicitMessage(LOGTAG, "SharedBlockStore",
+                        "SharedBlockStore: block {0} stored at file={1}, offset={2}, length={3}",
+                        blockID, fileIndex, offset, length);
+                }
             }
             else
             {
@@ -375,6 +397,23 @@ namespace Duplicati.Library.Main.Operation.Restore
         /// <see cref="SharedBlockStoreReadResult.ReadFailure"/> if the block is indexed but could not be read.
         /// </returns>
         public SharedBlockStoreReadResult TryGet(long blockID, out DataBlock? data)
+            => TryGet(blockID, remainingReferenceCount: null, out data);
+
+        /// <summary>
+        /// Tries to read a block from the store.
+        /// </summary>
+        /// <param name="blockID">The block's database ID.</param>
+        /// <param name="remainingReferenceCount">The number of remaining references for the block, when known.</param>
+        /// <param name="data">
+        /// On <see cref="SharedBlockStoreReadResult.Hit"/>, receives a new <see cref="DataBlock"/>
+        /// backed by an ArrayPool buffer. The caller is responsible for calling Dispose().
+        /// </param>
+        /// <returns>
+        /// <see cref="SharedBlockStoreReadResult.Miss"/> if the block is not in the index,
+        /// <see cref="SharedBlockStoreReadResult.Hit"/> if the block was read successfully,
+        /// <see cref="SharedBlockStoreReadResult.ReadFailure"/> if the block is indexed but could not be read.
+        /// </returns>
+        public SharedBlockStoreReadResult TryGet(long blockID, long? remainingReferenceCount, out DataBlock? data)
         {
             data = null;
 
@@ -408,9 +447,18 @@ namespace Duplicati.Library.Main.Operation.Restore
             if (success)
             {
                 data = new DataBlock(buffer);
-                Logging.Log.WriteExplicitMessage(LOGTAG, "SharedBlockStore",
-                    "SharedBlockStore: hit for block {0} at file={1}, offset={2}, length={3}",
-                    blockID, fileIndex, offset, length);
+                if (remainingReferenceCount.HasValue)
+                {
+                    Logging.Log.WriteExplicitMessage(LOGTAG, "SharedBlockStore",
+                        "SharedBlockStore: hit for block {0} at file={1}, offset={2}, length={3}, remaining_ref_count={4}",
+                        blockID, fileIndex, offset, length, remainingReferenceCount.Value);
+                }
+                else
+                {
+                    Logging.Log.WriteExplicitMessage(LOGTAG, "SharedBlockStore",
+                        "SharedBlockStore: hit for block {0} at file={1}, offset={2}, length={3}",
+                        blockID, fileIndex, offset, length);
+                }
                 
                 return SharedBlockStoreReadResult.Hit;
             }

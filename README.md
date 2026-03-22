@@ -2,6 +2,14 @@
 
 **English** | [中文](./README.zh-CN.md) | [日本語](./README.ja-JP.md)
 
+> Branch note
+>
+> If you are viewing this fork branch as part of the restore-cache investigation work, this branch includes investigation-specific runtime changes, the original in-repo restore-cache analyser, and reference documentation that are not intended to represent the default upstream Duplicati project direction on their own.
+>
+> Investigation context for this branch: [docs/RESTORE_CACHE_INVESTIGATION.md](./docs/RESTORE_CACHE_INVESTIGATION.md)
+>
+> External analyser and next-phase simulation work: <https://github.com/aureliandevel/duplicati-restore-cache-analyser>
+
 Store securely encrypted backups on cloud storage services!
 
 [![Backers on Open Collective](https://opencollective.com/duplicati/backers/badge.svg)](#backers) [![Sponsors on Open Collective](https://opencollective.com/duplicati/sponsors/badge.svg)](#sponsors) [![Build Status on Travis-CI](https://travis-ci.org/duplicati/duplicati.svg?branch=master)](https://travis-ci.org/duplicati/duplicati)

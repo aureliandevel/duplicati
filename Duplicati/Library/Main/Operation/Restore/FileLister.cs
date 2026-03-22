@@ -71,13 +71,17 @@ namespace Duplicati.Library.Main.Operation.Restore
                 try
                 {
                     sw_get_files?.Start();
+                    long sharedBlockThreshold = options.RestoreVolumeCacheHint != 0 && options.RestoreSharedBlockCacheThreshold > 0
+                        ? options.RestoreSharedBlockCacheThreshold
+                        : 0;
+
                     // The enumerables are cast to arrays to force the query to be executed and release the database lock.
                     // NOTE: the database layer owns the restore ordering (three-phase volume-aware ordering).
                     // Do not apply any secondary OrderBy/OrderByDescending here — it will silently break the
                     // cache-eviction optimisation. Priority files are an intentional user-driven override and
                     // are handled explicitly below; they do not affect the ordering of remaining files.
                     var files = await db
-                        .GetFilesAndSymlinksToRestore(result.TaskControl.ProgressToken)
+                        .GetFilesAndSymlinksToRestore(sharedBlockThreshold, options.SkipMetadata, result.TaskControl.ProgressToken)
                         .ToArrayAsync()
                         .ConfigureAwait(false);
 

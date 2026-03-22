@@ -46,6 +46,7 @@ public static class Program
                 Commands.Upgrade.Create(),
                 Commands.List.Create(),
                 Commands.Execute.Create(),
+                Commands.AnalyzeRestoreCache.Create(),
             };
 
         return new CommandLineBuilder(rootCmd)

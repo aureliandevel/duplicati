@@ -37,6 +37,7 @@ using System.Threading;
 
 // Expose internal classes to UnitTests, so that Database classes can be tested
 [assembly: InternalsVisibleTo("Duplicati.UnitTest")]
+[assembly: InternalsVisibleTo("Duplicati.CommandLine.DatabaseTool.Implementation")]
 
 namespace Duplicati.Library.Main.Database
 {

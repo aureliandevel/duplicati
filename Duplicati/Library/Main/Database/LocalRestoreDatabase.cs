@@ -1996,9 +1996,21 @@ namespace Duplicati.Library.Main.Database
         /// Returns a list of files and symlinks to restore.
         /// </summary>
         /// <remarks>At its current state, this method is designed to be called by Duplicati.Library.Main.Operation.Restore.FileLister. It locks the database to ensure that calls from Duplicati.Library.Main.Operation.Restore.BlockManager do not interfere with each other.</remarks>
+        /// <param name="sharedBlockThreshold">The shared-block threshold used to mirror SharedBlockStore routing. A value of 0 disables the shared-reference Phase-2 ordering.</param>
+        /// <param name="skipMetadata">Flag indicating whether the shared-reference ordering metric should exclude metadata blocks.</param>
         /// <param name="token">A cancellation token to monitor for cancellation requests.</param>
         /// <returns>An asynchronous enumerable of FileRequest objects representing the files and symlinks to restore.</returns>
-        public async IAsyncEnumerable<FileRequest> GetFilesAndSymlinksToRestore([EnumeratorCancellation] CancellationToken token)
+        public async IAsyncEnumerable<FileRequest> GetFilesAndSymlinksToRestore(long sharedBlockThreshold, bool skipMetadata, [EnumeratorCancellation] CancellationToken token)
+        {
+            await foreach (var (file, _) in GetFilesAndSymlinksToRestoreWithPhases(sharedBlockThreshold, skipMetadata, token).ConfigureAwait(false))
+                yield return file;
+        }
+
+        /// <summary>
+        /// Returns files and symlinks together with the SQL restore phase assigned by the query ordering.
+        /// </summary>
+        /// <remarks>Uses the same SQL and ordering as <see cref="GetFilesAndSymlinksToRestore(long, bool, CancellationToken)"/> so callers can inspect the exact phase without re-running the expensive phase-classification CTEs separately.</remarks>
+        internal async IAsyncEnumerable<(FileRequest File, int RestorePhase)> GetFilesAndSymlinksToRestoreWithPhases(long sharedBlockThreshold, bool skipMetadata, [EnumeratorCancellation] CancellationToken token)
         {
             await m_dbLock.WaitAsync(token).ConfigureAwait(false);
             try
@@ -2011,10 +2023,11 @@ namespace Duplicati.Library.Main.Database
                 //     can be evicted as soon as the last of those files finishes.
                 //
                 //   Phase 2 (VolumeCount = 1): small files whose blocks fit in a single volume.
-                //     Grouped by the volume containing the most files (densest first) so that
-                //     each volume can be evicted the moment its last file is restored.
-                //     *** Extension point: replace the Phase 2 ORDER BY lines for a different
-                //         small-file strategy (e.g. graph-based clustering). ***
+                //     SharedBlockStore-aware ordering prefers volumes whose shared blocks can
+                //     bulk-drain more remaining references on first access; file density remains
+                //     the fallback when shared-drain payoff is tied or disabled.
+                //     *** Extension point: replace or append the Phase 2 ORDER BY lines for a
+                //         different small-file strategy (e.g. graph-based clustering). ***
                 //
                 //   Phase 3 (VolumeCount IS NULL): zero-block entries — empty files, then
                 //     symlinks last so their targets are on disk before the link is created.
@@ -2027,7 +2040,54 @@ namespace Duplicati.Library.Main.Database
                 // RestorePhase) are used only in ORDER BY via CTE names and are NOT added to
                 // the SELECT list. The positional reader (positions 0-5) is unchanged.
                 var str_symlinkblocksetid = Library.Utility.Utility.FormatInvariantValue(SYMLINK_BLOCKSET_ID);
-                await using var cmd = m_connection.CreateCommand($@"
+                var sharedOrderingEnabled = sharedBlockThreshold > 0;
+                var metadataRefUnion = skipMetadata ? "" : $@"
+                        UNION ALL
+                        SELECT
+                            ""Block"".""ID""       AS ""BlockID"",
+                            ""Block"".""VolumeID"" AS ""VolumeID""
+                        FROM ""{m_tempfiletable}""
+                        INNER JOIN ""Metadataset""
+                            ON ""{m_tempfiletable}"".""MetadataID"" = ""Metadataset"".""ID""
+                        INNER JOIN ""BlocksetEntry""
+                            ON ""Metadataset"".""BlocksetID"" = ""BlocksetEntry"".""BlocksetID""
+                        INNER JOIN ""Block""
+                            ON ""BlocksetEntry"".""BlockID"" = ""Block"".""ID""";
+                var sharedReferenceCtes = sharedOrderingEnabled ? $@",
+                    ""RestoreBlockRefs"" AS (
+                        SELECT
+                            ""Block"".""ID""       AS ""BlockID"",
+                            ""Block"".""VolumeID"" AS ""VolumeID""
+                        FROM ""BlocksetEntry""
+                        INNER JOIN ""{m_tempfiletable}""
+                            ON ""BlocksetEntry"".""BlocksetID"" = ""{m_tempfiletable}"".""BlocksetID""
+                        INNER JOIN ""Block""
+                            ON ""BlocksetEntry"".""BlockID"" = ""Block"".""ID""
+                        {metadataRefUnion}
+                    ),
+                    ""SharedBlockRefs"" AS (
+                        SELECT
+                            ""RBR"".""BlockID"",
+                            MIN(""RBR"".""VolumeID"") AS ""VolumeID"",
+                            COUNT(*)                  AS ""RefCount""
+                        FROM ""RestoreBlockRefs"" ""RBR""
+                        GROUP BY ""RBR"".""BlockID""
+                        HAVING COUNT(*) > @SharedBlockThreshold
+                    ),
+                    ""SharedRefsPerVolume"" AS (
+                        SELECT
+                            ""SBR"".""VolumeID"",
+                            SUM(""SBR"".""RefCount"") AS ""SharedRefScore""
+                        FROM ""SharedBlockRefs"" ""SBR""
+                        GROUP BY ""SBR"".""VolumeID""
+                    )" : "";
+                var sharedReferenceJoin = sharedOrderingEnabled
+                    ? "\n                    LEFT JOIN \"SharedRefsPerVolume\" \"SRV\" ON \"FBV\".\"PrimaryVolID\" = \"SRV\".\"VolumeID\""
+                    : "";
+                var sharedReferenceOrdering = sharedOrderingEnabled
+                    ? "\n                        CASE WHEN \"FVC\".\"VolumeCount\" = 1 THEN IFNULL(\"SRV\".\"SharedRefScore\", 0) END DESC,"
+                    : "";
+                var sql = $@"
                     WITH ""FileVolumeCount"" AS (
                         SELECT
                             ""TF"".""ID"" AS ""FileID"",
@@ -2066,18 +2126,25 @@ namespace Duplicati.Library.Main.Database
                         )
                         GROUP BY ""FileID""
                     )
+                    {sharedReferenceCtes}
                     SELECT
                         ""F"".""ID"",
                         ""F"".""Path"",
                         ""F"".""TargetPath"",
                         IFNULL(""B"".""FullHash"", ''),
                         IFNULL(""B"".""Length"", 0) AS ""Length"",
-                        ""F"".""BlocksetID""
+                        ""F"".""BlocksetID"",
+                        CASE
+                            WHEN ""FVC"".""VolumeCount"" > 1 THEN 1
+                            WHEN ""FVC"".""VolumeCount"" = 1 THEN 2
+                            ELSE 3
+                        END AS ""RestorePhase""
                     FROM ""{m_tempfiletable}"" ""F""
                     LEFT JOIN ""Blockset"" ""B""          ON ""F"".""BlocksetID""    = ""B"".""ID""
                     LEFT JOIN ""FileVolumeCount"" ""FVC"" ON ""F"".""ID""            = ""FVC"".""FileID""
                     LEFT JOIN ""FileBestVolume""  ""FBV"" ON ""F"".""ID""            = ""FBV"".""FileID""
                     LEFT JOIN ""VolumeDensity""   ""VD""  ON ""FBV"".""PrimaryVolID"" = ""VD"".""VolumeID""
+                    {sharedReferenceJoin}
                     WHERE ""F"".""BlocksetID"" != {Library.Utility.Utility.FormatInvariantValue(FOLDER_BLOCKSET_ID)}
                     ORDER BY
                         CASE
@@ -2087,23 +2154,40 @@ namespace Duplicati.Library.Main.Database
                         END ASC,
                         CASE WHEN ""FVC"".""VolumeCount"" > 1 THEN ""B"".""Length""          END DESC,
                         CASE WHEN ""FVC"".""VolumeCount"" > 1 THEN ""FBV"".""PrimaryVolID""  END ASC,
+                        {sharedReferenceOrdering}
                         CASE WHEN ""FVC"".""VolumeCount"" = 1 THEN ""VD"".""FileCountInVolume"" END DESC,
                         CASE WHEN ""FVC"".""VolumeCount"" = 1 THEN ""FBV"".""PrimaryVolID""     END ASC,
                         IFNULL(""B"".""Length"", 0) DESC,
                         CASE WHEN ""FVC"".""VolumeCount"" IS NULL AND ""F"".""BlocksetID"" = {str_symlinkblocksetid} THEN 1 ELSE 0 END ASC
-                ")
+                ";
+                await using var cmd = m_connection.CreateCommand(sql)
                     .SetTransaction(m_rtr);
+
+                if (sharedOrderingEnabled)
+                    cmd.SetParameterValue("@SharedBlockThreshold", sharedBlockThreshold);
 
                 await using var rd = await cmd.ExecuteReaderAsync(token).ConfigureAwait(false);
                 while (await rd.ReadAsync(token).ConfigureAwait(false))
-                    yield return new FileRequest(
-                        rd.ConvertValueToInt64(0),
-                        rd.ConvertValueToString(1) ?? throw new InvalidOperationException("OriginalPath cannot be null"),
-                        rd.ConvertValueToString(2) ?? throw new InvalidOperationException("TargetPath cannot be null"),
-                        rd.ConvertValueToString(3) ?? throw new InvalidOperationException("Hash cannot be null"),
-                        rd.ConvertValueToInt64(4),
-                        rd.ConvertValueToInt64(5)
+                {
+                    var restorePhase = rd.ConvertValueToInt64(6, 3) switch
+                    {
+                        < 1 => 3,
+                        > 3 => 3,
+                        var phase => (int)phase,
+                    };
+
+                    yield return (
+                        new FileRequest(
+                            rd.ConvertValueToInt64(0),
+                            rd.ConvertValueToString(1) ?? throw new InvalidOperationException("OriginalPath cannot be null"),
+                            rd.ConvertValueToString(2) ?? throw new InvalidOperationException("TargetPath cannot be null"),
+                            rd.ConvertValueToString(3) ?? throw new InvalidOperationException("Hash cannot be null"),
+                            rd.ConvertValueToInt64(4),
+                            rd.ConvertValueToInt64(5)
+                        ),
+                        restorePhase
                     );
+                }
             }
             finally
             {
@@ -2292,16 +2376,14 @@ namespace Duplicati.Library.Main.Database
                 await using var reader = await cmd.ExecuteReaderAsync(token)
                     .ConfigureAwait(false);
                 for (long i = 0; await reader.ReadAsync(token).ConfigureAwait(false); i++)
-                {
-                    yield return new BlockRequest(
-                        reader.ConvertValueToInt64(0),
-                        i,
-                        reader.ConvertValueToString(1) ?? throw new InvalidOperationException("Block hash cannot be null"),
-                        reader.ConvertValueToInt64(2),
-                        reader.ConvertValueToInt64(3),
-                        BlockRequestType.Download
-                    );
-                }
+                        yield return new BlockRequest(
+                            reader.ConvertValueToInt64(0),
+                            i,
+                            reader.ConvertValueToString(1) ?? throw new InvalidOperationException("Block hash cannot be null"),
+                            reader.ConvertValueToInt64(2),
+                            reader.ConvertValueToInt64(3),
+                            BlockRequestType.Download
+                        );
             }
             finally
             {
@@ -2335,7 +2417,7 @@ namespace Duplicati.Library.Main.Database
         }
 
         /// <summary>
-        /// Returns the volume information for the given volume ID. It is used by the <see cref="VolumeManager"/> to get the volume information for the given volume ID.
+        /// Returns the volume information for the given volume ID.
         /// </summary>
         /// <param name="VolumeID">The ID of the volume.</param>
         /// <param name="token">A cancellation token to monitor for cancellation requests.</param>
@@ -2365,6 +2447,55 @@ namespace Duplicati.Library.Main.Database
                         reader.ConvertValueToString(0) ?? "",
                         reader.ConvertValueToInt64(1),
                         reader.ConvertValueToString(2) ?? ""
+                    );
+            }
+            finally
+            {
+                m_connection_pool.Add((connection, transaction));
+            }
+        }
+
+        /// <summary>
+        /// Returns extended metadata for the given volume ID, including the operation that created it.
+        /// </summary>
+        /// <param name="VolumeID">The ID of the volume.</param>
+        /// <param name="token">A cancellation token to monitor for cancellation requests.</param>
+        /// <returns>An asynchronous enumerable of tuples containing volume and creation metadata.</returns>
+        internal async IAsyncEnumerable<(string Name, long Size, string Hash, long OperationID, long OperationTimestamp, long ArchiveTime, string State)> GetVolumeExtendedInfo(long VolumeID, [EnumeratorCancellation] CancellationToken token)
+        {
+            var (connection, transaction) = await GetConnectionFromPool(token)
+                .ConfigureAwait(false);
+
+            try
+            {
+                await using var cmd = connection.CreateCommand(@"
+                    SELECT
+                        ""RemoteVolume"".""Name"",
+                        ""RemoteVolume"".""Size"",
+                        ""RemoteVolume"".""Hash"",
+                        ""RemoteVolume"".""OperationID"",
+                        ""Operation"".""Timestamp"",
+                        ""RemoteVolume"".""ArchiveTime"",
+                        ""RemoteVolume"".""State""
+                    FROM ""RemoteVolume""
+                    LEFT JOIN ""Operation""
+                        ON ""RemoteVolume"".""OperationID"" = ""Operation"".""ID""
+                    WHERE ""RemoteVolume"".""ID"" = @VolumeID
+                ")
+                    .SetTransaction(transaction)
+                    .SetParameterValue("@VolumeID", VolumeID);
+
+                await using var reader = await cmd.ExecuteReaderAsync(token)
+                    .ConfigureAwait(false);
+                while (await reader.ReadAsync(token).ConfigureAwait(false))
+                    yield return (
+                        reader.ConvertValueToString(0) ?? string.Empty,
+                        reader.ConvertValueToInt64(1),
+                        reader.ConvertValueToString(2) ?? string.Empty,
+                        reader.ConvertValueToInt64(3, -1),
+                        reader.ConvertValueToInt64(4, 0),
+                        reader.ConvertValueToInt64(5, 0),
+                        reader.ConvertValueToString(6) ?? string.Empty
                     );
             }
             finally
